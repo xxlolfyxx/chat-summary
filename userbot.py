@@ -3,6 +3,7 @@ import os
 from datetime import datetime, timedelta
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.types import Channel, Chat
 from groq import Groq
 
 # === НАСТРОЙКИ ===
@@ -19,16 +20,17 @@ client = TelegramClient(session, API_ID, API_HASH)
 groq_client = Groq(api_key=GROQ_KEY)
 
 messages_buffer = {}   # {название чата: [сообщения]}
-monitored_chats = []   # список чатов (изменяется командами /add и /del)
+monitored_chats = []   # список ID отслеживаемых чатов
+monitored_names = {}   # {chat_id: название}
+
+# Временное хранилище для выбора чата из списка
+pending_selection = {}  # {user_id: [{'id': ..., 'name': ...}]}
 
 
 def update_handlers():
-    """Перерегистрировать обработчик сообщений с актуальным списком чатов."""
-    # Снимаем все обработчики NewMessage (кроме команд)
     for cb in list(client._event_builders):
         if cb[0].__class__.__name__ == 'NewMessage' and getattr(cb[1], 'chats', None) is not None:
             client.remove_event_handler(cb[1], cb[0])
-
     if monitored_chats:
         @client.on(events.NewMessage(chats=monitored_chats))
         async def _on_message(event):
@@ -39,7 +41,7 @@ async def on_message(event):
     if not event.text:
         return
     chat = await event.get_chat()
-    name = getattr(chat, 'title', None) or getattr(chat, 'username', str(chat.id))
+    name = monitored_names.get(chat.id) or getattr(chat, 'title', str(chat.id))
     sender = await event.get_sender()
     who = getattr(sender, 'first_name', '?')
     messages_buffer.setdefault(name, []).append(f'{who}: {event.text}')
@@ -77,52 +79,79 @@ async def send_summary():
 
 # ── Команды ──────────────────────────────────────────────
 
-@client.on(events.NewMessage(pattern=r'/add(?:\s+(.+))?', outgoing=True))
+@client.on(events.NewMessage(pattern='/add', outgoing=True))
 async def cmd_add(event):
-    arg = event.pattern_match.group(1)
-    if not arg:
-        await event.respond('❌ Укажи username или ID чата.\nПример: `/add durov` или `/add -1001234567890`')
+    """Показать список чатов для выбора."""
+    await event.respond('⏳ Загружаю список чатов...')
+
+    dialogs = []
+    async for dialog in client.iter_dialogs(limit=50):
+        if isinstance(dialog.entity, (Channel, Chat)):
+            dialogs.append({
+                'id': dialog.entity.id,
+                'name': dialog.name,
+                'access_hash': getattr(dialog.entity, 'access_hash', None)
+            })
+
+    if not dialogs:
+        await event.respond('❌ Не найдено групп или каналов.')
         return
 
-    arg = arg.strip()
-    # Попробуем преобразовать в int если это ID
-    try:
-        chat_id = int(arg)
-        entry = chat_id
-    except ValueError:
-        entry = arg
+    me = await client.get_me()
+    pending_selection[me.id] = dialogs
 
-    if entry in monitored_chats:
-        await event.respond(f'⚠️ `{arg}` уже в списке.')
+    lines = []
+    for i, d in enumerate(dialogs, 1):
+        mark = '✅ ' if d['id'] in monitored_chats else ''
+        lines.append(f'{i}. {mark}{d["name"]}')
+
+    text = '📋 *Твои чаты и каналы:*\n\n' + '\n'.join(lines)
+    text += '\n\nОтветь цифрой чтобы добавить/убрать чат.\nПример: `3`'
+    await event.respond(text, parse_mode='md')
+
+
+@client.on(events.NewMessage(outgoing=True))
+async def cmd_select(event):
+    """Обработка выбора цифры из списка."""
+    if not event.text or not event.text.strip().isdigit():
         return
 
-    monitored_chats.append(entry)
-    update_handlers()
-    await event.respond(f'✅ Добавлен: `{arg}`\n\nТеперь отслеживается {len(monitored_chats)} чат(ов).', parse_mode='md')
-
-
-@client.on(events.NewMessage(pattern=r'/del(?:\s+(.+))?', outgoing=True))
-async def cmd_del(event):
-    arg = event.pattern_match.group(1)
-    if not arg:
-        await event.respond('❌ Укажи username или ID чата.\nПример: `/del durov`')
+    me = await client.get_me()
+    dialogs = pending_selection.get(me.id)
+    if not dialogs:
         return
 
-    arg = arg.strip()
-    try:
-        entry = int(arg)
-    except ValueError:
-        entry = arg
-
-    if entry not in monitored_chats:
-        await event.respond(f'⚠️ `{arg}` не найден в списке.')
+    num = int(event.text.strip())
+    if num < 1 or num > len(dialogs):
+        await event.respond(f'❌ Введи число от 1 до {len(dialogs)}')
         return
 
-    monitored_chats.remove(entry)
-    # Очищаем буфер этого чата
-    messages_buffer.pop(arg, None)
-    update_handlers()
-    await event.respond(f'🗑 Удалён: `{arg}`\n\nОсталось {len(monitored_chats)} чат(ов).', parse_mode='md')
+    chosen = dialogs[num - 1]
+    chat_id = chosen['id']
+    name = chosen['name']
+
+    if chat_id in monitored_chats:
+        monitored_chats.remove(chat_id)
+        monitored_names.pop(chat_id, None)
+        messages_buffer.pop(name, None)
+        update_handlers()
+        await event.respond(f'🗑 Убран: *{name}*\n\nОтслеживается: {len(monitored_chats)} чат(ов).', parse_mode='md')
+    else:
+        monitored_chats.append(chat_id)
+        monitored_names[chat_id] = name
+        update_handlers()
+        await event.respond(f'✅ Добавлен: *{name}*\n\nОтслеживается: {len(monitored_chats)} чат(ов).', parse_mode='md')
+
+    del pending_selection[me.id]
+
+
+@client.on(events.NewMessage(pattern='/chats', outgoing=True))
+async def cmd_chats(event):
+    if monitored_chats:
+        chats_text = '\n'.join(f'• {monitored_names.get(c, c)}' for c in monitored_chats)
+        await event.respond(f'📋 *Отслеживаемые чаты:*\n{chats_text}', parse_mode='md')
+    else:
+        await event.respond('⚠️ Список пуст. Напиши `/add` чтобы выбрать чаты.', parse_mode='md')
 
 
 @client.on(events.NewMessage(pattern='/summary', outgoing=True))
@@ -131,22 +160,12 @@ async def cmd_summary(event):
     await send_summary()
 
 
-@client.on(events.NewMessage(pattern='/chats', outgoing=True))
-async def cmd_chats(event):
-    if monitored_chats:
-        chats_text = '\n'.join(f'• {c}' for c in monitored_chats)
-        await event.respond(f'📋 Отслеживаемые чаты:\n{chats_text}')
-    else:
-        await event.respond('⚠️ Список чатов пуст.\nДобавь: `/add username_или_id`', parse_mode='md')
-
-
 @client.on(events.NewMessage(pattern='/help', outgoing=True))
 async def cmd_help(event):
     await event.respond(
         '🤖 *Команды юзербота:*\n\n'
-        '/add `username или ID` — добавить чат\n'
-        '/del `username или ID` — удалить чат\n'
-        '/chats — список отслеживаемых чатов\n'
+        '/add — выбрать чаты из списка\n'
+        '/chats — отслеживаемые чаты\n'
         '/summary — сводка прямо сейчас\n'
         '/help — помощь\n\n'
         f'⏰ Автосводка каждый день в {SUMMARY_HOUR}:00',
@@ -180,8 +199,7 @@ async def main():
 
     await client.send_message('me', (
         '✅ Юзербот запущен!\n\n'
-        '/add username — добавить чат\n'
-        '/del username — удалить чат\n'
+        '/add — выбрать чаты из списка\n'
         '/chats — список чатов\n'
         '/summary — сводка сейчас\n'
         '/help — помощь'
