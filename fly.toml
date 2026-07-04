@@ -1,0 +1,9 @@
+[app]
+name = "xxlolfyxx-summary-bot"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  SUMMARY_HOUR = "21"
