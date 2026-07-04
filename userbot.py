@@ -110,16 +110,16 @@ async def cmd_add(event):
     await event.respond(text, parse_mode='md')
 
 
-@client.on(events.NewMessage(outgoing=True))
+@client.on(events.NewMessage(pattern=r'^\d+$', outgoing=True))
 async def cmd_select(event):
     """Обработка выбора цифры из списка."""
-    if not event.text or not event.text.strip().isdigit():
-        return
-
     me = await client.get_me()
     dialogs = pending_selection.get(me.id)
     if not dialogs:
         return
+
+    # Останавливаем распространение чтобы другие хендлеры не сработали
+    event.stop_propagation()
 
     num = int(event.text.strip())
     if num < 1 or num > len(dialogs):
